@@ -1,6 +1,6 @@
 # EchoScribe
 
-EchoScribe is a local, restart-safe bulk video transcription tool for Windows. It recursively finds videos, transcribes them with `faster-whisper`, and writes TXT, SRT, and JSON output while preserving the source directory structure.
+EchoScribe is a local, restart-safe bulk video transcription application for Windows. Its desktop interface lets you select folders and monitor progress without using PowerShell. It recursively finds videos, transcribes them with `faster-whisper`, and writes TXT, SRT, and JSON output while preserving the source directory structure.
 
 Local-first is the recommended setup for a folder already on your Windows PC. The videos do not need to be uploaded, and EchoScribe can use a local NVIDIA GPU. A server/web interface can be added later without replacing the transcription core.
 
@@ -44,7 +44,25 @@ pip install -r requirements.txt
 
 The selected Whisper model is downloaded the first time it is used. `large-v3` requires several gigabytes of download/cache space.
 
-## 4. Run EchoScribe
+## 4. Run the desktop application
+
+Double-click:
+
+```text
+EchoScribe.bat
+```
+
+The application provides folder pickers, model and device controls, live progress and logs, safe stopping, and a shortcut to the transcript folder. Settings are remembered for the next launch.
+
+Stopping the app during a transcription is safe. Start it again with the same folder, and completed videos will be skipped automatically.
+
+You can also start the desktop interface from PowerShell:
+
+```powershell
+python gui.py
+```
+
+## 5. Run the command-line version
 
 ```powershell
 python transcribe.py "D:\path\to\videos"
