@@ -10,6 +10,7 @@ Local-first is the recommended setup for a folder already on your Windows PC. Th
 - Python 3.12 (64-bit)
 - Enough free disk space for the Whisper model and transcripts
 - Optional: an NVIDIA GPU with compatible CUDA 12/cuDNN 9 runtime libraries
+- Optional summaries: [Ollama for Windows](https://ollama.com/download/windows) and `gemma3:4b`
 
 `faster-whisper` uses PyAV, which bundles FFmpeg libraries, so a separate system FFmpeg installation is normally not required.
 
@@ -52,9 +53,26 @@ Double-click:
 EchoScribe.bat
 ```
 
-The application provides folder pickers, model and device controls, live progress and logs, safe stopping, and a shortcut to the transcript folder. Settings are remembered for the next launch.
+The application provides folder pickers, model and device controls, local AI summaries, live progress and logs, safe stopping, and a shortcut to the transcript folder. Settings are remembered for the next launch.
 
 Stopping the app during a transcription is safe. Start it again with the same folder, and completed videos will be skipped automatically.
+
+### Enable local bullet-point summaries
+
+Install Ollama for Windows, then download the default summary model once:
+
+```powershell
+ollama pull gemma3:4b
+```
+
+Open the Ollama application so its local service is running. In EchoScribe, leave **Generate local AI summaries** enabled and select `gemma3:4b`. After transcription finishes, EchoScribe releases the Whisper worker and creates:
+
+```text
+call1.summary.txt
+call1.summary.json
+```
+
+Summaries contain main points, decisions, action items, and open questions. Summary completion is tracked separately using a hash of the source transcript. A missing or failed summary is retried without retranscribing its video. All summary processing stays on the computer through Ollama's local API.
 
 You can also start the desktop interface from PowerShell:
 

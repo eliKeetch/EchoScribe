@@ -35,9 +35,11 @@ APP_NAME = "EchoScribe"
 ORGANIZATION_NAME = "Thrice Agency"
 PROJECT_DIRECTORY = Path(__file__).resolve().parent
 TRANSCRIBE_SCRIPT = PROJECT_DIRECTORY / "transcribe.py"
+SUMMARY_SCRIPT = PROJECT_DIRECTORY / "summarize.py"
 
 PROGRESS_PATTERN = re.compile(
-    r"^\[(?P<current>\d+)/(?P<total>\d+)] (?P<action>Transcribing:|SKIPPED)"
+    r"^\[(?P<current>\d+)/(?P<total>\d+)] "
+    r"(?P<action>Transcribing:|Summarizing:|SKIPPED)"
 )
 SUMMARY_PATTERNS = {
     "discovered": re.compile(r"^Videos discovered: (?P<value>\d+)$"),
@@ -199,6 +201,8 @@ class EchoScribeWindow(QMainWindow):
         self.output_buffer = ""
         self.expecting_video_path = False
         self.stop_requested = False
+        self.phase = "idle"
+        self.transcription_exit_code = 0
         self._build_window()
         self._configure_process()
         self._restore_settings()
@@ -331,6 +335,21 @@ class EchoScribeWindow(QMainWindow):
         self.force_checkbox.setToolTip("Replaces transcripts that are already complete")
         layout.addWidget(self.force_checkbox)
 
+        self.summary_checkbox = QCheckBox("Generate local AI summaries")
+        self.summary_checkbox.setAccessibleName("Generate local AI summaries")
+        self.summary_checkbox.setChecked(True)
+        layout.addWidget(self.summary_checkbox)
+
+        summary_model_label = QLabel("Ollama summary model")
+        summary_model_label.setObjectName("MetaLabel")
+        layout.addWidget(summary_model_label)
+        self.summary_model_combo = QComboBox()
+        self.summary_model_combo.setEditable(True)
+        self.summary_model_combo.addItems(["gemma3:4b", "qwen3:4b"])
+        self.summary_model_combo.setAccessibleName("Ollama summary model")
+        layout.addWidget(self.summary_model_combo)
+        self.summary_checkbox.toggled.connect(self.summary_model_combo.setEnabled)
+
         help_text = QLabel(
             "Automatic uses NVIDIA CUDA when available and falls back to CPU. "
             "Completed videos are skipped unless retranscription is enabled."
@@ -340,9 +359,9 @@ class EchoScribeWindow(QMainWindow):
         layout.addWidget(help_text)
         layout.addItem(QSpacerItem(1, 1, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding))
 
-        self.start_button = QPushButton("Start transcription")
+        self.start_button = QPushButton("Start processing")
         self.start_button.setObjectName("PrimaryButton")
-        self.start_button.setAccessibleName("Start transcription")
+        self.start_button.setAccessibleName("Start transcription and summaries")
         self.start_button.clicked.connect(self._start_transcription)
         layout.addWidget(self.start_button)
 
@@ -386,7 +405,7 @@ class EchoScribeWindow(QMainWindow):
         self.progress_bar.setAccessibleName("Batch progress")
         layout.addWidget(self.progress_bar)
 
-        current_label = QLabel("Current video")
+        current_label = QLabel("Current item")
         current_label.setObjectName("MetaLabel")
         layout.addWidget(current_label)
         self.current_file = QLabel("Waiting to start")
@@ -401,11 +420,13 @@ class EchoScribeWindow(QMainWindow):
         self.succeeded_metric = Metric("Completed")
         self.skipped_metric = Metric("Skipped")
         self.failed_metric = Metric("Failed")
+        self.summary_metric = Metric("Summaries")
         for metric in (
             self.discovered_metric,
             self.succeeded_metric,
             self.skipped_metric,
             self.failed_metric,
+            self.summary_metric,
         ):
             metric_row.addWidget(metric)
         metric_row.addStretch()
@@ -436,6 +457,16 @@ class EchoScribeWindow(QMainWindow):
         environment = QProcessEnvironment.systemEnvironment()
         environment.insert("PYTHONUTF8", "1")
         environment.insert("PYTHONUNBUFFERED", "1")
+        environment.insert("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+        nvidia_root = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
+        dll_directories = [
+            nvidia_root / "cublas" / "bin",
+            nvidia_root / "cudnn" / "bin",
+        ]
+        existing_dll_directories = [str(path) for path in dll_directories if path.is_dir()]
+        if existing_dll_directories:
+            current_path = environment.value("PATH", "")
+            environment.insert("PATH", ";".join(existing_dll_directories + [current_path]))
         self.process.setProcessEnvironment(environment)
         self.process.readyReadStandardOutput.connect(self._read_process_output)
         self.process.started.connect(self._process_started)
@@ -446,6 +477,12 @@ class EchoScribeWindow(QMainWindow):
         self.source_input.setText(self.settings.value("source", "", str))
         self.output_input.setText(self.settings.value("output", "", str))
         self.model_combo.setCurrentText(self.settings.value("model", "large-v3", str))
+        self.summary_model_combo.setCurrentText(
+            self.settings.value("summary_model", "gemma3:4b", str)
+        )
+        self.summary_checkbox.setChecked(
+            self.settings.value("summaries_enabled", True, bool)
+        )
         device = self.settings.value("device", "auto", str)
         index = self.device_combo.findData(device)
         self.device_combo.setCurrentIndex(max(0, index))
@@ -457,6 +494,8 @@ class EchoScribeWindow(QMainWindow):
         self.settings.setValue("source", self.source_input.text().strip())
         self.settings.setValue("output", self.output_input.text().strip())
         self.settings.setValue("model", self.model_combo.currentText().strip())
+        self.settings.setValue("summary_model", self.summary_model_combo.currentText().strip())
+        self.settings.setValue("summaries_enabled", self.summary_checkbox.isChecked())
         self.settings.setValue("device", self.device_combo.currentData())
         self.settings.setValue("geometry", self.saveGeometry())
 
@@ -513,6 +552,16 @@ class EchoScribeWindow(QMainWindow):
                 self, APP_NAME, f"The transcription engine is missing:\n\n{TRANSCRIBE_SCRIPT}"
             )
             return None
+        if self.summary_checkbox.isChecked():
+            if not self.summary_model_combo.currentText().strip():
+                QMessageBox.warning(self, APP_NAME, "Enter or select an Ollama model.")
+                self.summary_model_combo.setFocus()
+                return None
+            if not SUMMARY_SCRIPT.is_file():
+                QMessageBox.critical(
+                    self, APP_NAME, f"The summary engine is missing:\n\n{SUMMARY_SCRIPT}"
+                )
+                return None
         return source.resolve(), model
 
     def _start_transcription(self) -> None:
@@ -524,6 +573,7 @@ class EchoScribeWindow(QMainWindow):
         source, model = validated
         self._save_settings()
         self._reset_run_state()
+        self.phase = "transcription"
 
         arguments = [
             "-u",
@@ -562,7 +612,8 @@ class EchoScribeWindow(QMainWindow):
             self.process.kill()
 
     def _process_started(self) -> None:
-        self._set_status("Running", running=True)
+        label = "Summarizing" if self.phase == "summary" else "Running"
+        self._set_status(label, running=True)
 
     def _read_process_output(self) -> None:
         data = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
@@ -590,6 +641,14 @@ class EchoScribeWindow(QMainWindow):
             self.progress_label.setText(f"0 of {total} videos")
             return
 
+        found_transcripts = re.match(r"^Found (\d+) completed transcripts\.$", line)
+        if found_transcripts:
+            total = int(found_transcripts.group(1))
+            self.progress_bar.setRange(0, max(1, total))
+            self.progress_bar.setValue(0)
+            self.progress_label.setText(f"0 of {total} summaries")
+            return
+
         progress = PROGRESS_PATTERN.match(line)
         if progress:
             current = int(progress.group("current"))
@@ -597,10 +656,13 @@ class EchoScribeWindow(QMainWindow):
             action = progress.group("action")
             self.progress_bar.setRange(0, max(1, total))
             self.progress_bar.setValue(current)
-            self.progress_label.setText(f"{current} of {total} videos")
+            unit = "summaries" if self.phase == "summary" else "videos"
+            self.progress_label.setText(f"{current} of {total} {unit}")
             self.expecting_video_path = True
             if action.startswith("SKIPPED"):
                 self._set_status("Skipping completed", running=True)
+            elif action.startswith("Summarizing"):
+                self._set_status("Summarizing", running=True)
             else:
                 self._set_status("Transcribing", running=True)
             return
@@ -618,26 +680,76 @@ class EchoScribeWindow(QMainWindow):
             metric.set_value(value)
             return
 
+        summaries_generated = re.match(r"^Summaries generated: (\d+)$", line)
+        if summaries_generated:
+            self.summary_metric.set_value(int(summaries_generated.group(1)))
+            return
+
     def _process_finished(self, exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
         if self.output_buffer.strip():
             self._parse_output_line(self.output_buffer.strip())
         self.output_buffer = ""
-        self._set_controls_running(False)
         if self.stop_requested:
+            self._set_controls_running(False)
             self._set_status("Stopped")
             self.current_file.setText("Stopped. Run again to resume safely.")
+            self.phase = "idle"
+        elif (
+            self.phase == "transcription"
+            and self.summary_checkbox.isChecked()
+            and exit_code in (0, 1)
+        ):
+            self.transcription_exit_code = exit_code
+            self._start_summary_phase()
+            return
         elif exit_code == 0:
-            self._set_status("Complete")
-            self.current_file.setText("All available videos processed.")
+            self._set_controls_running(False)
+            if self.phase == "summary" and self.transcription_exit_code:
+                self._set_status("Complete with transcription errors", error=True)
+                self.current_file.setText(
+                    "Summaries are complete for every successful transcript."
+                )
+            else:
+                self._set_status("Complete")
+                message = (
+                    "Transcripts and summaries are complete."
+                    if self.phase == "summary"
+                    else "All available videos processed."
+                )
+                self.current_file.setText(message)
             if self.progress_bar.maximum() > 0:
                 self.progress_bar.setValue(self.progress_bar.maximum())
+            self.phase = "idle"
         else:
+            self._set_controls_running(False)
             failed = int(self.failed_metric.value.text())
-            label = f"Complete · {failed} failed" if failed else "Could not complete"
+            label = "Summary errors" if self.phase == "summary" else "Could not complete"
+            if self.phase != "summary" and failed:
+                label = f"Complete with {failed} failed"
             self._set_status(label, error=True)
-            if not failed:
+            if not failed or self.phase == "summary":
                 self.current_file.setText("Check the log for details.")
+            self.phase = "idle"
         self.stop_requested = False
+
+    def _start_summary_phase(self) -> None:
+        self.phase = "summary"
+        self.output_buffer = ""
+        self.expecting_video_path = False
+        self._append_log("\nStarting local Ollama summaries…\n\n")
+        self._set_status("Preparing summaries", running=True)
+        self.current_file.setText("Checking completed transcripts and Ollama…")
+        self.progress_bar.setRange(0, 0)
+        arguments = [
+            "-u",
+            str(SUMMARY_SCRIPT),
+            str(self._effective_output_directory().resolve()),
+            "--model",
+            self.summary_model_combo.currentText().strip(),
+        ]
+        if self.force_checkbox.isChecked():
+            arguments.append("--force")
+        self.process.start(sys.executable, arguments)
 
     def _process_error(self, error: QProcess.ProcessError) -> None:
         if error == QProcess.ProcessError.FailedToStart:
@@ -646,6 +758,7 @@ class EchoScribeWindow(QMainWindow):
             )
             self._set_controls_running(False)
             self._set_status("Could not start", error=True)
+            self.phase = "idle"
 
     def _reset_run_state(self) -> None:
         self.output_buffer = ""
@@ -656,6 +769,7 @@ class EchoScribeWindow(QMainWindow):
             self.succeeded_metric,
             self.skipped_metric,
             self.failed_metric,
+            self.summary_metric,
         ):
             metric.set_value(0)
         self.progress_label.setText("0 of 0 videos")
@@ -671,6 +785,8 @@ class EchoScribeWindow(QMainWindow):
             self.model_combo,
             self.device_combo,
             self.force_checkbox,
+            self.summary_checkbox,
+            self.summary_model_combo,
         ):
             control.setEnabled(not running)
 
